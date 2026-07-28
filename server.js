@@ -1,142 +1,797 @@
-const express = require('express');
-const admin = require('firebase-admin');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const fetch = require('node-fetch');
+const express = require("express");
+const admin = require("firebase-admin");
+
+const SERVICE_NAME = "Peyson AI Worker";
+const WORKER_VERSION = "2.0.0";
+const PORT = Number(process.env.PORT) || 10000;
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const MODEL_FALLBACK = "gemini-flash-latest";
+const MAX_CONCURRENT_JOBS = 2;
+const MAX_IMAGES = 5;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024;
+const GEMINI_TIMEOUT_MS = 120000;
+const IMAGE_TIMEOUT_MS = 30000;
+const MAX_API_ATTEMPTS = 3;
+const STALE_PROCESSING_MS = 15 * 60 * 1000;
+
+const ALLOWED_MODELS = new Set([
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.1-pro-preview",
+  "gemini-flash-latest",
+  "gemini-pro-latest",
+]);
+
+const ALLOWED_IMAGE_HOSTS = new Set([
+  "firebasestorage.googleapis.com",
+  "storage.googleapis.com",
+]);
+
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/heic",
+  "image/heif",
+  "image/gif",
+  "image/bmp",
+  "image/tiff",
+]);
+
+const PRODUCT_SCHEMA = {
+  type: "object",
+  properties: {
+    title_zh: {
+      type: "string",
+      description: "專業、自然的繁體中文商品名稱；不得加入來源未提供的規格。",
+    },
+    title_en: {
+      type: "string",
+      description: "與中文名稱事實一致的自然英文商品名稱。",
+    },
+    product_highlights_zh: {
+      type: "array",
+      items: { type: "string" },
+      description: "3至6點繁體中文產品特色；只寫有來源依據的內容。",
+    },
+    product_highlights_en: {
+      type: "array",
+      items: { type: "string" },
+      description: "與中文特色逐點對應的英文內容。",
+    },
+    description_zh: {
+      type: "string",
+      description: "適合台灣B2B展示網站的繁體中文純文字文案，不含價格與HTML。",
+    },
+    description_en: {
+      type: "string",
+      description: "與中文文案事實一致的英文純文字文案，不含價格與HTML。",
+    },
+    extracted: {
+      type: "object",
+      properties: {
+        product_type: { type: "string" },
+        material: { type: "string" },
+        dimensions: { type: "string" },
+        capacity: { type: "string" },
+        colors: { type: "array", items: { type: "string" } },
+        variants: { type: "array", items: { type: "string" } },
+        packaging: { type: "string" },
+        supplier_moq: { type: "string" },
+        customization: { type: "string" },
+        certifications: { type: "array", items: { type: "string" } },
+      },
+      required: [
+        "product_type",
+        "material",
+        "dimensions",
+        "capacity",
+        "colors",
+        "variants",
+        "packaging",
+        "supplier_moq",
+        "customization",
+        "certifications",
+      ],
+    },
+    specifications: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          label_zh: { type: "string" },
+          label_en: { type: "string" },
+          value: { type: "string" },
+          source: {
+            type: "string",
+            description: "text、image_1、image_2、user_input 等來源標記。",
+          },
+        },
+        required: ["label_zh", "label_en", "value", "source"],
+      },
+    },
+    seo_title_zh: { type: "string" },
+    seo_title_en: { type: "string" },
+    seo_description_zh: { type: "string" },
+    seo_description_en: { type: "string" },
+    seo_keywords: { type: "array", items: { type: "string" } },
+    missing_fields: {
+      type: "array",
+      items: { type: "string" },
+      description: "來源沒有提供、上架前建議人工補充的欄位。",
+    },
+    conflicts: {
+      type: "array",
+      items: { type: "string" },
+      description: "不同來源互相矛盾的資訊；沒有則回傳空陣列。",
+    },
+    evidence: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          field: { type: "string" },
+          value: { type: "string" },
+          source: { type: "string" },
+          raw_quote: {
+            type: "string",
+            description: "支持此欄位的短原文或圖片辨識文字。",
+          },
+        },
+        required: ["field", "value", "source", "raw_quote"],
+      },
+    },
+    confidence: {
+      type: "number",
+      description: "整體資料可信度，0到1。",
+    },
+  },
+  required: [
+    "title_zh",
+    "title_en",
+    "product_highlights_zh",
+    "product_highlights_en",
+    "description_zh",
+    "description_en",
+    "extracted",
+    "specifications",
+    "seo_title_zh",
+    "seo_title_en",
+    "seo_description_zh",
+    "seo_description_en",
+    "seo_keywords",
+    "missing_fields",
+    "conflicts",
+    "evidence",
+    "confidence",
+  ],
+};
+
+const SYSTEM_INSTRUCTION = `
+你是 Peyson 沛森國際有限公司的 B2B 商品資料整理與雙語文案助理。
+
+工作原則：
+1. 先從使用者提供的文字與圖片中辨識商品資訊，再撰寫繁體中文與英文文案。
+2. 只能使用來源中明確出現的事實；不得自行猜測材質、尺寸、容量、認證、產地、交期、庫存、包裝或供應商起訂量。
+3. 圖片中的簡體中文可轉為台灣常用繁體中文，但數值、單位、型號與規格不可改變。
+4. 圖片與文字矛盾時，不可擅自選一個答案，必須記錄在 conflicts。
+5. 資料不足時使用空字串或空陣列，並把重要缺漏列入 missing_fields。
+6. evidence 必須標示資訊來自 text、image_1、image_2 或 user_input，並保留簡短原文。
+7. 使用者輸入的「目標 MOQ」是沛森希望提供客戶的目標，不可寫成供應商保證的 MOQ。
+8. 不輸出任何價格、原價、重量計價、庫存數量、隱藏商品設定或付款承諾。
+9. 文案風格要專業、簡潔、適合企業採購與客製禮贈品情境，避免誇大、絕對化與無證據宣稱。
+10. 中文使用台灣繁體中文；英文內容必須與中文事實一致。
+11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
+`;
+
+function requireEnvironment() {
+  const missing = ["FIREBASE_SERVICE_ACCOUNT", "GEMINI_API_KEY"].filter(
+    (name) => !process.env[name]
+  );
+
+  if (missing.length > 0) {
+    throw new Error(`缺少必要的 Render 環境變數：${missing.join(", ")}`);
+  }
+}
+
+function parseServiceAccount(rawValue) {
+  let parsed = JSON.parse(rawValue);
+
+  if (typeof parsed === "string") {
+    parsed = JSON.parse(parsed);
+  }
+
+  if (typeof parsed.private_key === "string") {
+    parsed.private_key = parsed.private_key.replace(/\\n/g, "\n");
+  }
+
+  return parsed;
+}
+
+requireEnvironment();
+
+const serviceAccount = parseServiceAccount(
+  process.env.FIREBASE_SERVICE_ACCOUNT
+);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
+const Timestamp = admin.firestore.Timestamp;
 
 const app = express();
-const port = process.env.PORT || 10000; // Render 預設慣用 Port
+app.disable("x-powered-by");
 
-// ==========================================
-// 1. 初始化 Firebase Admin SDK (雲端最高權限)
-// ==========================================
-// 透過 Render 環境變數讀取 Firebase 伺服器金鑰
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+app.get("/", (_req, res) => {
+  res.type("text/plain").send(`${SERVICE_NAME} is running securely!`);
 });
-const db = admin.firestore();
 
-// ==========================================
-// 2. 初始化 Gemini AI
-// ==========================================
-// 透過 Render 環境變數讀取 Google API Key
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: SERVICE_NAME,
+    version: WORKER_VERSION,
+    defaultModel: DEFAULT_MODEL,
+    firebase: "connected",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-// ==========================================
-// 3. 核心邏輯：監聽 Firestore 待辦任務
-// ==========================================
-console.log("🚀 雲端 AI 機器人已啟動，正在監聽待辦任務...");
+app.use((_req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
+});
 
-// 24 小時監聽 products 集合中，狀態為 'pending' (待處理) 的資料
-db.collection('products').where('status', '==', 'pending').onSnapshot(async (snapshot) => {
-    for (const change of snapshot.docChanges()) {
-        if (change.type === 'added') {
-            const docId = change.doc.id;
-            const docData = change.doc.data();
-            console.log(`📦 收到新任務: ${docId}`);
-
-            try {
-                // 步驟 A：標記為處理中，避免重複執行
-                await db.collection('products').doc(docId).update({ status: 'processing' });
-
-                // 步驟 B：準備沛森專屬的 AI 系統指令 (System Prompt)
-                const systemPrompt = `
-你是一位隸屬於「沛森 (Peyson Ltd)」的資深 B2B 企業禮品文案行銷專家。沛森專注於提供高質感的「企業客製禮贈品」、「IP 周邊製作」以及獨特的「活動現場客製 LIVE PRINT」服務。
-
-【品牌口吻與風格設定】
-1. 專業且具溫度：強調禮品能傳遞品牌價值與真實連結。
-2. B2B 導向：主要受眾為企業採購、公關行銷人員、活動策展團隊。
-3. 突顯工藝：自然帶入沛森的專業加工技術，強調「少量也能做、精緻有質感」。
-4. 絕對禁忌：嚴禁提及任何價格、售價、數字金額。嚴格剔除大陸用語（如：質量、定制、打印），請使用台灣慣用電商用語（如：品質、客製、列印）。
-
-【內容結構與格式要求】
-- 商品名稱 (title)：精煉且具吸引力。
-- 商品摘要 (summary)：**必須**使用全形黑點「・」進行條列式排版。除了商品本身規格外，請務必根據情境自然加入沛森的優勢，例如：「・少量客製，1件起訂」、「・專屬企業LOGO客製」、「・可在活動現場客製化印製」。
-- 詳細描述 (description)：需包含「產品特色介紹」、「適用場景（如尾牙、展會、VIP贈禮）」等段落。繁體中文版結尾**必須固定加上**：「※ 企業採購如需索取樣品、確認起訂量或正式報價，請聯繫沛森專員。」
-- SEO：精準打中企業採購與客製化禮品的搜尋痛點。
-
-【輸出格式限制】
-你必須以「純 JSON 格式」輸出，嚴禁包含任何 Markdown 標籤 (如 \`\`\`json) 或其他說明文字。JSON 必須精準包含以下 Key：
-{
-  "handle": "英文與數字組合的商品網址代稱(如 custom-thermos-mug)",
-  "title_en": "英文商品名稱",
-  "title_zh": "繁體中文商品名稱",
-  "summary_en": "英文商品摘要 (使用・列點)",
-  "summary_zh": "繁體中文商品摘要 (使用・列點)",
-  "description_en": "英文詳細描述 (使用純文字搭配換行符號 \\n)",
-  "description_zh": "繁體中文詳細描述 (使用純文字搭配換行符號 \\n)",
-  "seo_title_en": "英文 SEO 標題",
-  "seo_title_zh": "繁體中文 SEO 標題",
-  "seo_desc_en": "英文 SEO 簡介",
-  "seo_desc_zh": "繁體中文 SEO 簡介",
-  "seo_keywords": "SEO 關鍵字 (中英皆可，以逗號分隔)"
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
-`;
 
-                const userPrompt = `
-請根據以下 1688 原始資料，轉換為沛森的商品文案：
-- 支援客製化工藝：${docData.customOptions}
-- 企業起訂量 (MOQ)：${docData.moq}
-- 原始文字資料：${docData.rawText || '無文字，請專注分析圖片規格'}
-`;
+function cleanText(value, maxLength = 12000) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim().slice(0, maxLength);
+}
 
-                const parts = [
-                    { text: systemPrompt },
-                    { text: userPrompt }
-                ];
+function sanitizeError(error) {
+  return cleanText(error && error.message ? error.message : error, 1200)
+    .replace(process.env.GEMINI_API_KEY, "[REDACTED]")
+    .replace(/\s+/g, " ");
+}
 
-                // 步驟 C：如果有圖片，將圖片抓下來轉成 Base64 交給 Gemini 分析
-                if (docData.imageUrl) {
-                    console.log(`🖼️ 正在讀取圖片...`);
-                    const response = await fetch(docData.imageUrl);
-                    const buffer = await response.buffer();
-                    parts.push({
-                        inlineData: {
-                            data: buffer.toString('base64'),
-                            mimeType: response.headers.get('content-type') || 'image/jpeg'
-                        }
-                    });
-                }
+function resolveModel(requestedModel) {
+  const requested = cleanText(requestedModel, 80);
+  return ALLOWED_MODELS.has(requested) ? requested : DEFAULT_MODEL;
+}
 
-                // 步驟 D：呼叫 Gemini AI
-                console.log(`🧠 正在呼叫 Gemini 模型 (${docData.aiModel || 'gemini-1.5-pro'})...`);
-                const model = genAI.getGenerativeModel({ model: docData.aiModel || 'gemini-1.5-pro' });
-                const result = await model.generateContent({ contents: [{ role: 'user', parts }] });
-                
-                // 步驟 E：清理與解析 AI 回傳的 JSON 格式
-                let rawText = result.response.text();
-                // 移除前後可能帶有的 Markdown json 標籤
-                rawText = rawText.replace(/^```json/mi, '').replace(/```$/m, '').trim();
-                const aiResult = JSON.parse(rawText);
+function normalizeImageUrls(data) {
+  const candidates = [];
 
-                // 步驟 F：將完美轉換的結果寫回 Firebase，狀態改為 'completed'
-                await db.collection('products').doc(docId).update({
-                    status: 'completed',
-                    aiResult: aiResult,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-                console.log(`✅ 任務完成: ${docId}`);
+  if (Array.isArray(data.sourceImages)) {
+    candidates.push(...data.sourceImages);
+  }
 
-            } catch (error) {
-                console.error(`❌ 任務失敗 ${docId}:`, error);
-                // 發生錯誤時，將狀態改為 'error' 並記錄錯誤訊息，前端就不會無止盡等待
-                await db.collection('products').doc(docId).update({ 
-                    status: 'error', 
-                    errorMsg: error.message,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-            }
-        }
+  if (Array.isArray(data.imageUrls)) {
+    candidates.push(...data.imageUrls);
+  }
+
+  if (data.imageUrl) {
+    candidates.push(data.imageUrl);
+  }
+
+  const urls = candidates
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return "";
+      return item.downloadURL || item.url || item.src || "";
+    })
+    .map((url) => cleanText(url, 3000))
+    .filter(Boolean);
+
+  return [...new Set(urls)].slice(0, MAX_IMAGES);
+}
+
+function validateImageUrl(rawUrl) {
+  let url;
+
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error("圖片網址格式不正確。");
+  }
+
+  if (url.protocol !== "https:") {
+    throw new Error("圖片網址必須使用 HTTPS。");
+  }
+
+  if (!ALLOWED_IMAGE_HOSTS.has(url.hostname)) {
+    throw new Error(
+      `目前只接受 Firebase Storage 圖片，無法讀取主機：${url.hostname}`
+    );
+  }
+
+  return url.toString();
+}
+
+async function fetchImageAsInput(rawUrl, imageNumber) {
+  const url = validateImageUrl(rawUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      redirect: "follow",
+    });
+
+    if (!response.ok) {
+      throw new Error(`圖片 ${imageNumber} 下載失敗（HTTP ${response.status}）。`);
     }
+
+    let mimeType = cleanText(
+      response.headers.get("content-type"),
+      100
+    ).split(";")[0];
+
+    if (mimeType === "image/jpg") mimeType = "image/jpeg";
+
+    if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
+      throw new Error(`圖片 ${imageNumber} 的檔案類型不正確。`);
+    }
+
+    const declaredSize = Number(response.headers.get("content-length")) || 0;
+    if (declaredSize > MAX_IMAGE_BYTES) {
+      throw new Error(`圖片 ${imageNumber} 超過 4 MB，請先壓縮後再上傳。`);
+    }
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > MAX_IMAGE_BYTES) {
+      throw new Error(`圖片 ${imageNumber} 超過 4 MB，請先壓縮後再上傳。`);
+    }
+
+    return {
+      bytes: bytes.length,
+      input: {
+        type: "image",
+        data: bytes.toString("base64"),
+        mime_type: mimeType,
+      },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildImageInputs(imageUrls) {
+  const downloaded = await Promise.all(
+    imageUrls.map((url, index) => fetchImageAsInput(url, index + 1))
+  );
+
+  const totalBytes = downloaded.reduce((sum, item) => sum + item.bytes, 0);
+  if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
+    throw new Error("全部圖片合計超過 12 MB，請減少張數或先壓縮圖片。");
+  }
+
+  const inputs = [];
+  downloaded.forEach((item, index) => {
+    inputs.push({
+      type: "text",
+      text: `以下是 image_${index + 1}：`,
+    });
+    inputs.push(item.input);
+  });
+
+  return inputs;
+}
+
+function buildUserPrompt(data, imageCount) {
+  const payload = {
+    source_text: cleanText(data.rawText),
+    current_category: cleanText(data.category, 200),
+    peyson_target_moq: cleanText(data.moq, 100),
+    requested_customization: cleanText(data.customOptions, 1000),
+    image_count: imageCount,
+  };
+
+  return `
+請依照系統規則整理以下商品資料，並嚴格依照指定 JSON Schema 回傳。
+
+輸入資料：
+${JSON.stringify(payload, null, 2)}
+
+補充要求：
+- current_category 是 ERP 已選分類，不要擅自改分類。
+- peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
+- 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
+- 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
+`;
+}
+
+class GeminiApiError extends Error {
+  constructor(message, status = 0, retryable = false) {
+    super(message);
+    this.name = "GeminiApiError";
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+function extractInteractionText(responseBody) {
+  if (typeof responseBody.output_text === "string") {
+    return responseBody.output_text;
+  }
+
+  const texts = [];
+  for (const step of responseBody.steps || []) {
+    if (step.type !== "model_output") continue;
+    for (const content of step.content || []) {
+      if (content.type === "text" && typeof content.text === "string") {
+        texts.push(content.text);
+      }
+    }
+  }
+
+  return texts.join("");
+}
+
+async function callGeminiOnce(model, input) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/interactions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": process.env.GEMINI_API_KEY,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          input,
+          system_instruction: SYSTEM_INSTRUCTION,
+          response_format: {
+            type: "text",
+            mime_type: "application/json",
+            schema: PRODUCT_SCHEMA,
+          },
+          generation_config: {
+            temperature: 0.2,
+            max_output_tokens: 8192,
+          },
+          store: false,
+        }),
+      }
+    );
+
+    const responseText = await response.text();
+    let responseBody = {};
+
+    try {
+      responseBody = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      throw new GeminiApiError(
+        `Gemini 回傳非 JSON 格式（HTTP ${response.status}）。`,
+        response.status,
+        response.status >= 500
+      );
+    }
+
+    if (!response.ok) {
+      const message =
+        responseBody.error?.message ||
+        responseBody.message ||
+        `Gemini API 呼叫失敗（HTTP ${response.status}）。`;
+      const retryable = [408, 429, 500, 502, 503, 504].includes(
+        response.status
+      );
+      throw new GeminiApiError(message, response.status, retryable);
+    }
+
+    if (responseBody.status && responseBody.status !== "completed") {
+      throw new GeminiApiError(
+        `Gemini 工作未完成，狀態：${responseBody.status}`,
+        0,
+        true
+      );
+    }
+
+    const outputText = extractInteractionText(responseBody);
+    if (!outputText) {
+      throw new GeminiApiError("Gemini 沒有回傳可用文字。", 0, true);
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(outputText);
+    } catch {
+      throw new GeminiApiError("Gemini 回傳內容無法解析為 JSON。", 0, true);
+    }
+
+    for (const requiredField of PRODUCT_SCHEMA.required) {
+      if (!(requiredField in parsed)) {
+        throw new GeminiApiError(
+          `Gemini 結果缺少必要欄位：${requiredField}`,
+          0,
+          true
+        );
+      }
+    }
+
+    return {
+      result: parsed,
+      interactionId: responseBody.id || "",
+      usage: responseBody.usage || {},
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new GeminiApiError("Gemini API 等待逾時。", 408, true);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callWithRetries(model, input) {
+  const delays = [0, 2500, 7000];
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_API_ATTEMPTS; attempt += 1) {
+    if (delays[attempt - 1] > 0) {
+      await sleep(delays[attempt - 1]);
+    }
+
+    try {
+      const response = await callGeminiOnce(model, input);
+      return { ...response, apiAttempts: attempt };
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[Gemini] model=${model} attempt=${attempt}/${MAX_API_ATTEMPTS} status=${
+          error.status || "n/a"
+        } message=${sanitizeError(error)}`
+      );
+
+      if (!error.retryable || attempt === MAX_API_ATTEMPTS) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+async function generateProductContent(requestedModel, input) {
+  const primaryModel = resolveModel(requestedModel);
+
+  try {
+    const response = await callWithRetries(primaryModel, input);
+    return { ...response, model: primaryModel, usedFallback: false };
+  } catch (error) {
+    if (error.status !== 404 || primaryModel === MODEL_FALLBACK) {
+      throw error;
+    }
+
+    console.warn(
+      `[Gemini] model=${primaryModel} not found; falling back to ${MODEL_FALLBACK}`
+    );
+    const response = await callWithRetries(MODEL_FALLBACK, input);
+    return { ...response, model: MODEL_FALLBACK, usedFallback: true };
+  }
+}
+
+async function claimProduct(ref) {
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(ref);
+
+    if (!snapshot.exists || snapshot.data().status !== "pending") {
+      return null;
+    }
+
+    const attemptCount = (Number(snapshot.data().attemptCount) || 0) + 1;
+
+    transaction.update(ref, {
+      status: "processing",
+      processingStartedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      attemptCount,
+      workerVersion: WORKER_VERSION,
+      errorMsg: FieldValue.delete(),
+    });
+
+    return {
+      data: snapshot.data(),
+      attemptCount,
+    };
+  });
+}
+
+async function processProduct(ref) {
+  const claimed = await claimProduct(ref);
+  if (!claimed) return;
+
+  const { data, attemptCount } = claimed;
+  const imageUrls = normalizeImageUrls(data);
+  const startedAt = Date.now();
+
+  console.log(
+    `[Job ${ref.id}] started images=${imageUrls.length} requestedModel=${cleanText(
+      data.aiModel,
+      80
+    ) || "default"}`
+  );
+
+  try {
+    if (!cleanText(data.rawText) && imageUrls.length === 0) {
+      throw new Error("沒有可供 AI 分析的商品文字或圖片。");
+    }
+
+    const imageInputs = await buildImageInputs(imageUrls);
+    const input = [
+      {
+        type: "text",
+        text: buildUserPrompt(data, imageUrls.length),
+      },
+      ...imageInputs,
+    ];
+
+    const generated = await generateProductContent(data.aiModel, input);
+    const result = {
+      ...generated.result,
+      category: cleanText(data.category, 200),
+      target_moq: cleanText(data.moq, 100),
+      requested_customization: cleanText(data.customOptions, 1000),
+    };
+
+    await ref.update({
+      aiResult: result,
+      status: "completed",
+      completedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      errorMsg: FieldValue.delete(),
+      aiMeta: {
+        provider: "google",
+        api: "interactions-v1beta",
+        model: generated.model,
+        requestedModel: cleanText(data.aiModel, 80),
+        usedFallback: generated.usedFallback,
+        workerVersion: WORKER_VERSION,
+        imageCount: imageUrls.length,
+        apiAttempts: generated.apiAttempts,
+        jobAttemptCount: attemptCount,
+        interactionId: generated.interactionId,
+        processingMs: Date.now() - startedAt,
+        inputTokens: Number(generated.usage.total_input_tokens) || 0,
+        outputTokens: Number(generated.usage.total_output_tokens) || 0,
+      },
+    });
+
+    console.log(
+      `[Job ${ref.id}] completed model=${generated.model} durationMs=${
+        Date.now() - startedAt
+      }`
+    );
+  } catch (error) {
+    const errorMessage = sanitizeError(error);
+
+    await ref.update({
+      status: "error",
+      errorMsg: errorMessage,
+      failedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      aiMeta: {
+        provider: "google",
+        requestedModel: cleanText(data.aiModel, 80),
+        workerVersion: WORKER_VERSION,
+        imageCount: imageUrls.length,
+        jobAttemptCount: attemptCount,
+        processingMs: Date.now() - startedAt,
+        httpStatus: Number(error.status) || 0,
+      },
+    });
+
+    console.error(`[Job ${ref.id}] failed: ${errorMessage}`);
+  }
+}
+
+const queuedIds = new Set();
+const activeIds = new Set();
+const jobQueue = [];
+
+function drainQueue() {
+  while (
+    activeIds.size < MAX_CONCURRENT_JOBS &&
+    jobQueue.length > 0
+  ) {
+    const ref = jobQueue.shift();
+    queuedIds.delete(ref.id);
+    activeIds.add(ref.id);
+
+    processProduct(ref)
+      .catch((error) => {
+        console.error(
+          `[Job ${ref.id}] unexpected worker error: ${sanitizeError(error)}`
+        );
+      })
+      .finally(() => {
+        activeIds.delete(ref.id);
+        drainQueue();
+      });
+  }
+}
+
+function enqueueProduct(ref) {
+  if (queuedIds.has(ref.id) || activeIds.has(ref.id)) return;
+  queuedIds.add(ref.id);
+  jobQueue.push(ref);
+  drainQueue();
+}
+
+const unsubscribe = db
+  .collection("products")
+  .where("status", "==", "pending")
+  .onSnapshot(
+    (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === "added" || change.type === "modified") {
+          enqueueProduct(change.doc.ref);
+        }
+      });
+    },
+    (error) => {
+      console.error(`[Firestore listener] ${sanitizeError(error)}`);
+    }
+  );
+
+async function recoverStaleProducts() {
+  const snapshot = await db
+    .collection("products")
+    .where("status", "==", "processing")
+    .get();
+  const now = Date.now();
+  const staleRefs = snapshot.docs.filter((doc) => {
+    const startedAt = doc.data().processingStartedAt;
+    return !startedAt || now - startedAt.toMillis() >= STALE_PROCESSING_MS;
+  });
+
+  await Promise.all(
+    staleRefs.map((doc) =>
+      doc.ref.update({
+        status: "pending",
+        updatedAt: FieldValue.serverTimestamp(),
+        recoveryNote: "Worker restarted after stale processing state.",
+      })
+    )
+  );
+
+  if (staleRefs.length > 0) {
+    console.log(`Recovered ${staleRefs.length} stale product job(s).`);
+  }
+}
+
+const server = app.listen(PORT, () => {
+  console.log(`${SERVICE_NAME} v${WORKER_VERSION} listening on port ${PORT}`);
+  console.log(
+    `Listening for pending product tasks; default model=${DEFAULT_MODEL}`
+  );
 });
 
-// ==========================================
-// 4. 啟動 Web Server (為了讓 Render 偵測到服務存活)
-// ==========================================
-app.get('/', (req, res) => {
-  res.send('Peyson AI Worker is running securely!');
+recoverStaleProducts().catch((error) => {
+  console.error(`[Recovery] ${sanitizeError(error)}`);
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+function shutdown(signal) {
+  console.log(`${signal} received; shutting down.`);
+  unsubscribe();
+  server.close(() => process.exit(0));
+
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
