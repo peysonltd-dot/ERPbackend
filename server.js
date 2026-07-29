@@ -1,9 +1,10 @@
 const express = require("express");
 const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.0.1";
+const WORKER_VERSION = "2.1.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -169,6 +170,27 @@ const PRODUCT_SCHEMA = {
   ],
 };
 
+const ENGLISH_SYNC_SCHEMA = {
+  type: "object",
+  properties: {
+    title_en: { type: "string" },
+    product_highlights_en: {
+      type: "array",
+      items: { type: "string" },
+    },
+    description_en: { type: "string" },
+    seo_title_en: { type: "string" },
+    seo_description_en: { type: "string" },
+  },
+  required: [
+    "title_en",
+    "product_highlights_en",
+    "description_en",
+    "seo_title_en",
+    "seo_description_en",
+  ],
+};
+
 const SYSTEM_INSTRUCTION = `
 你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的 B2B 商品資料整理與雙語文案助理。
 
@@ -187,6 +209,20 @@ const SYSTEM_INSTRUCTION = `
 12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
 13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
 14. 避免在同一句重複商品名稱、材質、容量或其他相同資訊，文案需自然精簡。
+`;
+
+const ENGLISH_SYNC_INSTRUCTION = `
+你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的雙語商品編輯。
+
+請將使用者提供的最新繁體中文商品內容同步為自然、專業的英文，適合 B2B 企業禮贈品網站。
+
+規則：
+1. 英文必須忠實對應目前繁中內容，不得沿用舊英文內容。
+2. 不得新增來源未提供的材質、尺寸、容量、認證、產地、交期、價格、庫存或功能。
+3. 中文只寫「保溫」時使用 insulated，不得擅自翻譯成 vacuum；只有中文明確寫「真空」時才可使用 vacuum。
+4. 品牌名稱使用 Peyson Gifts；公司正式英文名稱使用 Peyson Consulting Co., Ltd.
+5. product_highlights_en 必須與繁中特色逐點對應，數量及順序一致。
+6. description_en 與 SEO 欄位使用自然英文，不輸出 Markdown、HTML 或額外說明。
 `;
 
 function requireEnvironment() {
@@ -227,6 +263,28 @@ const db = getFirestore();
 
 const app = express();
 app.disable("x-powered-by");
+app.use(express.json({ limit: "256kb" }));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowedOrigins = new Set([
+    "https://peysonltd-dot.github.io",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ]);
+
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(origin && allowedOrigins.has(origin) ? 204 : 403);
+  }
+
+  return next();
+});
 
 app.get("/", (_req, res) => {
   res.type("text/plain").send(`${SERVICE_NAME} is running securely!`);
@@ -241,6 +299,51 @@ app.get("/health", (_req, res) => {
     firebase: "connected",
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post("/api/sync-english", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const englishInput = {
+      title_zh: cleanText(req.body?.title_zh, 300),
+      product_highlights_zh: Array.isArray(req.body?.product_highlights_zh)
+        ? req.body.product_highlights_zh.map((item) => cleanText(item, 600)).slice(0, 12)
+        : [],
+      description_zh: cleanText(req.body?.description_zh, 8000),
+      seo_title_zh: cleanText(req.body?.seo_title_zh, 300),
+      seo_description_zh: cleanText(req.body?.seo_description_zh, 1000),
+    };
+
+    if (
+      !englishInput.title_zh &&
+      !englishInput.description_zh &&
+      englishInput.product_highlights_zh.length === 0
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "請先提供繁中商品名稱或商品文案。",
+      });
+    }
+
+    const generated = await generateEnglishSync(englishInput);
+    return res.json({
+      ok: true,
+      result: generated.result,
+      meta: {
+        model: generated.model,
+        usedFallback: generated.usedFallback,
+        apiAttempts: generated.apiAttempts,
+      },
+    });
+  } catch (error) {
+    const status = Number(error.status) || 500;
+    console.error(
+      `[English sync] uid=${req.user?.uid || "unknown"} error=${sanitizeError(error)}`
+    );
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      ok: false,
+      error: sanitizeError(error),
+    });
+  }
 });
 
 app.use((_req, res) => {
@@ -260,6 +363,22 @@ function sanitizeError(error) {
   return cleanText(error && error.message ? error.message : error, 1200)
     .replace(process.env.GEMINI_API_KEY, "[REDACTED]")
     .replace(/\s+/g, " ");
+}
+
+async function requireAuthenticatedUser(req, res, next) {
+  const authorization = cleanText(req.headers.authorization, 5000);
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+  if (!match) {
+    return res.status(401).json({ ok: false, error: "缺少登入驗證資訊。" });
+  }
+
+  try {
+    req.user = await getAuth().verifyIdToken(match[1]);
+    return next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "登入驗證已失效，請重新登入。" });
+  }
 }
 
 function resolveModel(requestedModel) {
@@ -438,7 +557,12 @@ function extractInteractionText(responseBody) {
   return texts.join("");
 }
 
-async function callGeminiOnce(model, input) {
+async function callGeminiOnce(model, input, options = {}) {
+  const {
+    systemInstruction = SYSTEM_INSTRUCTION,
+    responseSchema = PRODUCT_SCHEMA,
+    maxOutputTokens = 8192,
+  } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
@@ -455,15 +579,15 @@ async function callGeminiOnce(model, input) {
         body: JSON.stringify({
           model,
           input,
-          system_instruction: SYSTEM_INSTRUCTION,
+          system_instruction: systemInstruction,
           response_format: {
             type: "text",
             mime_type: "application/json",
-            schema: PRODUCT_SCHEMA,
+            schema: responseSchema,
           },
           generation_config: {
             temperature: 0.2,
-            max_output_tokens: 8192,
+            max_output_tokens: maxOutputTokens,
           },
           store: false,
         }),
@@ -514,7 +638,7 @@ async function callGeminiOnce(model, input) {
       throw new GeminiApiError("Gemini 回傳內容無法解析為 JSON。", 0, true);
     }
 
-    for (const requiredField of PRODUCT_SCHEMA.required) {
+    for (const requiredField of responseSchema.required || []) {
       if (!(requiredField in parsed)) {
         throw new GeminiApiError(
           `Gemini 結果缺少必要欄位：${requiredField}`,
@@ -539,7 +663,7 @@ async function callGeminiOnce(model, input) {
   }
 }
 
-async function callWithRetries(model, input) {
+async function callWithRetries(model, input, options = {}) {
   const delays = [0, 2500, 7000];
   let lastError;
 
@@ -549,7 +673,7 @@ async function callWithRetries(model, input) {
     }
 
     try {
-      const response = await callGeminiOnce(model, input);
+      const response = await callGeminiOnce(model, input, options);
       return { ...response, apiAttempts: attempt };
     } catch (error) {
       lastError = error;
@@ -568,11 +692,11 @@ async function callWithRetries(model, input) {
   throw lastError;
 }
 
-async function generateProductContent(requestedModel, input) {
+async function generateProductContent(requestedModel, input, options = {}) {
   const primaryModel = resolveModel(requestedModel);
 
   try {
-    const response = await callWithRetries(primaryModel, input);
+    const response = await callWithRetries(primaryModel, input, options);
     return { ...response, model: primaryModel, usedFallback: false };
   } catch (error) {
     if (error.status !== 404 || primaryModel === MODEL_FALLBACK) {
@@ -582,9 +706,28 @@ async function generateProductContent(requestedModel, input) {
     console.warn(
       `[Gemini] model=${primaryModel} not found; falling back to ${MODEL_FALLBACK}`
     );
-    const response = await callWithRetries(MODEL_FALLBACK, input);
+    const response = await callWithRetries(MODEL_FALLBACK, input, options);
     return { ...response, model: MODEL_FALLBACK, usedFallback: true };
   }
+}
+
+async function generateEnglishSync(englishInput) {
+  const input = [
+    {
+      type: "text",
+      text: `請依規則將以下最新繁中商品內容同步為英文，並嚴格按照 JSON Schema 回傳：\n${JSON.stringify(
+        englishInput,
+        null,
+        2
+      )}`,
+    },
+  ];
+
+  return generateProductContent(DEFAULT_MODEL, input, {
+    systemInstruction: ENGLISH_SYNC_INSTRUCTION,
+    responseSchema: ENGLISH_SYNC_SCHEMA,
+    maxOutputTokens: 4096,
+  });
 }
 
 async function claimProduct(ref) {
