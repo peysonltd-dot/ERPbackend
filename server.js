@@ -3,7 +3,7 @@ const { initializeApp, cert } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.0.0";
+const WORKER_VERSION = "2.0.1";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -170,7 +170,7 @@ const PRODUCT_SCHEMA = {
 };
 
 const SYSTEM_INSTRUCTION = `
-你是 Peyson 沛森國際有限公司的 B2B 商品資料整理與雙語文案助理。
+你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的 B2B 商品資料整理與雙語文案助理。
 
 工作原則：
 1. 先從使用者提供的文字與圖片中辨識商品資訊，再撰寫繁體中文與英文文案。
@@ -184,6 +184,9 @@ const SYSTEM_INSTRUCTION = `
 9. 文案風格要專業、簡潔、適合企業採購與客製禮贈品情境，避免誇大、絕對化與無證據宣稱。
 10. 中文使用台灣繁體中文；英文內容必須與中文事實一致。
 11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
+12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
+13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
+14. 避免在同一句重複商品名稱、材質、容量或其他相同資訊，文案需自然精簡。
 `;
 
 function requireEnvironment() {
