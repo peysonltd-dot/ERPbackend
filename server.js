@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.2.0";
+const WORKER_VERSION = "2.3.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -55,7 +55,7 @@ const PRODUCT_SCHEMA = {
     product_highlights_zh: {
       type: "array",
       items: { type: "string" },
-      description: "2至4點繁體中文產品特色；每點只寫一項有來源依據、具有搜尋價值的資訊。",
+      description: "2至6點繁體中文商品特色；採官網列點規格邏輯，優先列出 MOQ、尺寸、容量、重量、材質、功能與客製方式，每點只寫一項有來源依據、具有搜尋價值的資訊。",
     },
     product_highlights_en: {
       type: "array",
@@ -77,9 +77,9 @@ const PRODUCT_SCHEMA = {
         material: { type: "string" },
         dimensions: { type: "string" },
         capacity: { type: "string" },
+        weight: { type: "string" },
         colors: { type: "array", items: { type: "string" } },
         variants: { type: "array", items: { type: "string" } },
-        packaging: { type: "string" },
         supplier_moq: { type: "string" },
         customization: { type: "string" },
         certifications: { type: "array", items: { type: "string" } },
@@ -89,9 +89,9 @@ const PRODUCT_SCHEMA = {
         "material",
         "dimensions",
         "capacity",
+        "weight",
         "colors",
         "variants",
-        "packaging",
         "supplier_moq",
         "customization",
         "certifications",
@@ -196,23 +196,24 @@ const SYSTEM_INSTRUCTION = `
 
 工作原則：
 1. 先從使用者提供的文字與圖片中辨識商品資訊，再撰寫繁體中文與英文文案。
-2. 只能使用來源中明確出現的事實；不得自行猜測材質、尺寸、容量、認證、產地、交期、庫存、包裝或供應商起訂量。
+2. 只能使用來源中明確出現的事實；不得自行猜測材質、尺寸、容量、重量、認證、產地、交期、庫存或供應商起訂量。
 3. 圖片中的簡體中文可轉為台灣常用繁體中文，但數值、單位、型號與規格不可改變。
 4. 圖片與文字矛盾時，不可擅自選一個答案，必須記錄在 conflicts。
 5. 資料不足時使用空字串或空陣列，並把重要缺漏列入 missing_fields。
 6. evidence 必須標示資訊來自 text、image_1、image_2 或 user_input，並保留簡短原文。
 7. 使用者輸入的「目標 MOQ」是沛森希望提供客戶的目標，不可寫成供應商保證的 MOQ。
-8. 不輸出任何價格、原價、重量計價、庫存數量、隱藏商品設定或付款承諾。
+8. 不輸出任何價格、原價、計價方式、庫存數量、隱藏商品設定或付款承諾。
 9. 所有文案以 SEO 搜尋意圖為優先：自然納入來源可證實的商品類型、材質、用途、客製工藝與企業禮贈品情境；關鍵字必須自然，不可堆疊。
 10. 中文使用台灣繁體中文；英文內容必須與中文事實一致。
 11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
 12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
 13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
-14. 商品特色寫 2 至 4 點，每點一個可驗證重點；商品描述只補充採購用途與客製資訊，不可逐句重抄特色。
-15. 禁止「質感升級、理想選擇、彰顯品味、精緻呈現、為您打造」等沒有具體資訊的空泛句；沒有新資訊就不要寫。
-16. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
-17. 活動現場客製說明由 ERP 依使用者選項統一附加，AI 的商品特色與商品描述正文不得自行加入或重複「活動現場客製」句子。
-18. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
+14. 商品特色採沛森官網既有的列點式規格邏輯，依資料完整度寫 2 至 6 點。優先排列：目標 MOQ、尺寸、容量、重量、材質、產品功能、客製工藝；沒有來源的欄位不要硬湊。
+15. 商品描述使用自然敘述，說明外觀、使用方式、適用情境與企業採購用途；不得改用規格清單，也不可逐句重抄商品特色。
+16. 禁止「質感升級、理想選擇、彰顯品味、精緻呈現、為您打造」等沒有具體資訊的空泛句；沒有新資訊就不要寫。
+17. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
+18. 活動現場客製說明由 ERP 依使用者選項統一附加，AI 的商品特色與商品描述正文不得自行加入或重複「活動現場客製」句子。
+19. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
 `;
 
 const ENGLISH_SYNC_INSTRUCTION = `
@@ -222,11 +223,11 @@ const ENGLISH_SYNC_INSTRUCTION = `
 
 規則：
 1. 英文必須忠實對應目前繁中內容，不得沿用舊英文內容。
-2. 不得新增來源未提供的材質、尺寸、容量、認證、產地、交期、價格、庫存或功能。
+2. 不得新增來源未提供的材質、尺寸、容量、重量、認證、產地、交期、價格、庫存或功能。
 3. 中文只寫「保溫」時使用 insulated，不得擅自翻譯成 vacuum；只有中文明確寫「真空」時才可使用 vacuum。
 4. 品牌名稱使用 Peyson Gifts；公司正式英文名稱使用 Peyson Consulting Co., Ltd.
-5. product_highlights_en 必須與繁中特色逐點對應，數量及順序一致。
-6. description_en 與 SEO 欄位使用自然英文，不輸出 Markdown、HTML 或額外說明。
+5. product_highlights_en 必須與繁中特色逐點對應，數量及順序一致；保留列點式規格結構。
+6. description_en 使用自然敘述，SEO 欄位使用自然英文；不輸出 Markdown、HTML 或額外說明。
 7. 以 SEO 搜尋意圖為優先，使用具體商品詞、材質、用途與客製工藝；不得加入空泛銷售句或關鍵字堆疊。
 8. 商品特色與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
 9. 若繁中描述已有活動現場客製說明，只翻譯一次，不得另外重複加入同義句。
@@ -408,7 +409,7 @@ function sanitizeProductCopy(result = {}) {
     if (!key || seen.has(key)) continue;
     seen.add(key);
     pairs.push({ zh, en });
-    if (pairs.length === 4) break;
+    if (pairs.length === 6) break;
   }
 
   return {
@@ -432,7 +433,7 @@ function sanitizeEnglishSyncCopy(result = {}) {
       seen.add(key);
       return true;
     })
-    .slice(0, 4);
+    .slice(0, 6);
 
   return {
     ...result,
@@ -607,8 +608,10 @@ ${JSON.stringify(payload, null, 2)}
 補充要求：
 - current_category 是 ERP 已選分類，不要擅自改分類。
 - peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
+- peyson_target_moq 若大於 0，可在商品特色中寫成「最低訂購量：X 件」；requested_customization 可列為「客製方式」，但不得寫成供應商原始規格。
 - 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
 - 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
+- 商品特色使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質、功能與客製方式；商品描述改用敘述式文案，兩者不要重複。
 - source_text 中的網址只作為來源紀錄，無法證明頁面內容；不得把網址本身當作商品資料。
 - 活動現場客製固定說明由 ERP 另行處理，正文不要自行加入。
 `;
