@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.4.0";
+const WORKER_VERSION = "2.5.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
