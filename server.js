@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.1.0";
+const WORKER_VERSION = "2.2.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -55,7 +55,7 @@ const PRODUCT_SCHEMA = {
     product_highlights_zh: {
       type: "array",
       items: { type: "string" },
-      description: "3至6點繁體中文產品特色；只寫有來源依據的內容。",
+      description: "2至4點繁體中文產品特色；每點只寫一項有來源依據、具有搜尋價值的資訊。",
     },
     product_highlights_en: {
       type: "array",
@@ -64,7 +64,7 @@ const PRODUCT_SCHEMA = {
     },
     description_zh: {
       type: "string",
-      description: "適合台灣B2B展示網站的繁體中文純文字文案，不含價格與HTML。",
+      description: "適合台灣B2B搜尋與閱讀的精簡繁體中文純文字文案，不含價格、HTML、空泛口號或重複資訊。",
     },
     description_en: {
       type: "string",
@@ -203,12 +203,16 @@ const SYSTEM_INSTRUCTION = `
 6. evidence 必須標示資訊來自 text、image_1、image_2 或 user_input，並保留簡短原文。
 7. 使用者輸入的「目標 MOQ」是沛森希望提供客戶的目標，不可寫成供應商保證的 MOQ。
 8. 不輸出任何價格、原價、重量計價、庫存數量、隱藏商品設定或付款承諾。
-9. 文案風格要專業、簡潔、適合企業採購與客製禮贈品情境，避免誇大、絕對化與無證據宣稱。
+9. 所有文案以 SEO 搜尋意圖為優先：自然納入來源可證實的商品類型、材質、用途、客製工藝與企業禮贈品情境；關鍵字必須自然，不可堆疊。
 10. 中文使用台灣繁體中文；英文內容必須與中文事實一致。
 11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
 12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
 13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
-14. 避免在同一句重複商品名稱、材質、容量或其他相同資訊，文案需自然精簡。
+14. 商品特色寫 2 至 4 點，每點一個可驗證重點；商品描述只補充採購用途與客製資訊，不可逐句重抄特色。
+15. 禁止「質感升級、理想選擇、彰顯品味、精緻呈現、為您打造」等沒有具體資訊的空泛句；沒有新資訊就不要寫。
+16. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
+17. 活動現場客製說明由 ERP 依使用者選項統一附加，AI 的商品特色與商品描述正文不得自行加入或重複「活動現場客製」句子。
+18. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
 `;
 
 const ENGLISH_SYNC_INSTRUCTION = `
@@ -223,6 +227,9 @@ const ENGLISH_SYNC_INSTRUCTION = `
 4. 品牌名稱使用 Peyson Gifts；公司正式英文名稱使用 Peyson Consulting Co., Ltd.
 5. product_highlights_en 必須與繁中特色逐點對應，數量及順序一致。
 6. description_en 與 SEO 欄位使用自然英文，不輸出 Markdown、HTML 或額外說明。
+7. 以 SEO 搜尋意圖為優先，使用具體商品詞、材質、用途與客製工藝；不得加入空泛銷售句或關鍵字堆疊。
+8. 商品特色與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
+9. 若繁中描述已有活動現場客製說明，只翻譯一次，不得另外重複加入同義句。
 `;
 
 function requireEnvironment() {
@@ -327,7 +334,7 @@ app.post("/api/sync-english", requireAuthenticatedUser, async (req, res) => {
     const generated = await generateEnglishSync(englishInput);
     return res.json({
       ok: true,
-      result: generated.result,
+      result: sanitizeEnglishSyncCopy(generated.result),
       meta: {
         model: generated.model,
         usedFallback: generated.usedFallback,
@@ -357,6 +364,81 @@ function sleep(ms) {
 function cleanText(value, maxLength = 12000) {
   if (value === null || value === undefined) return "";
   return String(value).trim().slice(0, maxLength);
+}
+
+function stripNonSeoBrands(value) {
+  return cleanText(value)
+    .replace(/沛森顧問有限公司/g, "")
+    .replace(/沛森禮品/g, "")
+    .replace(/Peyson Consulting Co\.,?\s*Ltd\.?/gi, "")
+    .replace(/Peyson Gifts/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([，。！？,.!?])/g, "$1")
+    .trim();
+}
+
+function dedupeParagraphs(value) {
+  const seen = new Set();
+  return cleanText(value)
+    .split(/\n+/)
+    .map((paragraph) => stripNonSeoBrands(paragraph))
+    .filter((paragraph) => {
+      const key = paragraph.toLowerCase().replace(/\s+/g, "");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .join("\n\n");
+}
+
+function sanitizeProductCopy(result = {}) {
+  const highlightsZh = Array.isArray(result.product_highlights_zh)
+    ? result.product_highlights_zh
+    : [];
+  const highlightsEn = Array.isArray(result.product_highlights_en)
+    ? result.product_highlights_en
+    : [];
+  const seen = new Set();
+  const pairs = [];
+
+  for (let index = 0; index < Math.max(highlightsZh.length, highlightsEn.length); index += 1) {
+    const zh = stripNonSeoBrands(highlightsZh[index]);
+    const en = stripNonSeoBrands(highlightsEn[index]);
+    const key = (zh || en).toLowerCase().replace(/\s+/g, "");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ zh, en });
+    if (pairs.length === 4) break;
+  }
+
+  return {
+    ...result,
+    product_highlights_zh: pairs.map((item) => item.zh),
+    product_highlights_en: pairs.map((item) => item.en),
+    description_zh: dedupeParagraphs(result.description_zh),
+    description_en: dedupeParagraphs(result.description_en),
+  };
+}
+
+function sanitizeEnglishSyncCopy(result = {}) {
+  const seen = new Set();
+  const highlights = (Array.isArray(result.product_highlights_en)
+    ? result.product_highlights_en
+    : [])
+    .map((item) => stripNonSeoBrands(item))
+    .filter((item) => {
+      const key = item.toLowerCase().replace(/\s+/g, "");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 4);
+
+  return {
+    ...result,
+    product_highlights_en: highlights,
+    description_en: dedupeParagraphs(result.description_en),
+  };
 }
 
 function sanitizeError(error) {
@@ -527,6 +609,8 @@ ${JSON.stringify(payload, null, 2)}
 - peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
 - 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
 - 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
+- source_text 中的網址只作為來源紀錄，無法證明頁面內容；不得把網址本身當作商品資料。
+- 活動現場客製固定說明由 ERP 另行處理，正文不要自行加入。
 `;
 }
 
@@ -787,7 +871,7 @@ async function processProduct(ref) {
 
     const generated = await generateProductContent(data.aiModel, input);
     const result = {
-      ...generated.result,
+      ...sanitizeProductCopy(generated.result),
       category: cleanText(data.category, 200),
       target_moq: cleanText(data.moq, 100),
       requested_customization: cleanText(data.customOptions, 1000),
