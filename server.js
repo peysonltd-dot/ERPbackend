@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.6.0";
+const WORKER_VERSION = "2.6.1";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -191,6 +191,43 @@ const ENGLISH_SYNC_SCHEMA = {
   ],
 };
 
+const PRODUCT_CONTENT_SYNC_SCHEMA = {
+  type: "object",
+  properties: {
+    title_en: { type: "string" },
+    product_highlights_zh: {
+      type: "array",
+      items: { type: "string" },
+    },
+    product_highlights_en: {
+      type: "array",
+      items: { type: "string" },
+    },
+    description_zh: { type: "string" },
+    description_en: { type: "string" },
+    seo_title_zh: { type: "string" },
+    seo_title_en: { type: "string" },
+    seo_description_zh: { type: "string" },
+    seo_description_en: { type: "string" },
+    seo_keywords: {
+      type: "array",
+      items: { type: "string" },
+    },
+  },
+  required: [
+    "title_en",
+    "product_highlights_zh",
+    "product_highlights_en",
+    "description_zh",
+    "description_en",
+    "seo_title_zh",
+    "seo_title_en",
+    "seo_description_zh",
+    "seo_description_en",
+    "seo_keywords",
+  ],
+};
+
 const SYSTEM_INSTRUCTION = `
 你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的 B2B 商品資料整理與雙語文案助理。
 
@@ -231,6 +268,25 @@ const ENGLISH_SYNC_INSTRUCTION = `
 7. 以 SEO 搜尋意圖為優先，使用具體商品詞、材質、用途與客製工藝；不得加入空泛銷售句或關鍵字堆疊。
 8. 商品特色與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
 9. 「印製工藝」與「活動現場客製」特色由 ERP 統一整理；若輸入中已有這兩類特色，忠實翻譯一次，不得另加同義句。
+`;
+
+const PRODUCT_CONTENT_SYNC_INSTRUCTION = `
+你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的 B2B 商品資料同步編輯。
+
+使用者已在 ERP 編輯頁人工確認並修改商品名稱、規格、MOQ、分類與客製方式。請把這些最新欄位視為唯一有效的母資料，重新整理中英文商品文案。
+
+規則：
+1. title_zh 由 ERP 保留，不需回傳；title_en 必須依最新 title_zh 重新產生，不得沿用名稱不一致的舊英文。
+2. latest_product_data 與 current_copy 都是可用來源，但結構化欄位一律以 latest_product_data 為準；current_copy 中未被最新資料否定的既有用途或功能可保留。不得新增或猜測規格、功能、認證、產地、交期、價格、庫存或供應商資訊。
+3. latest_product_data 中空白的材質、尺寸、容量、重量或顏色代表該項規格目前不應出現在文案；若 current_copy 含有與最新規格矛盾或已被清空的規格，必須移除。
+4. 商品特色採 2 至 6 點列點式規格，依資料完整度優先放入 MOQ、尺寸、容量、重量、材質、顏色與具體功能；每點只寫一項資訊。
+5. 商品描述使用自然敘述，說明商品外觀、用途、使用情境與企業採購用途；不得逐句重抄商品特色。
+6. customization_crafts 與 onsite_customization 只供理解客製情境。「印製工藝」及「活動現場客製」固定特色由 ERP 在回傳後附加，product_highlights 與 description 不得自行加入或重複這兩類句子。
+7. SEO 欄位可自然使用最新商品名稱、商品類型、確定規格、企業禮贈品情境與客製工藝，但不可堆疊關鍵字。
+8. 中英文特色的數量、順序與事實必須逐點對應；英文忠實反映最新繁中內容。
+9. 中文只寫「保溫」時，英文使用 insulated；只有明確寫出真空結構時才可使用 vacuum。
+10. 品牌名稱一律使用「沛森禮品」／Peyson Gifts；商品特色與描述合計最多出現一次品牌名稱，一般情況不要主動加入。
+11. 不輸出 Markdown、HTML、額外說明或指定 JSON Schema 以外的欄位。
 `;
 
 function requireEnvironment() {
@@ -354,6 +410,70 @@ app.post("/api/sync-english", requireAuthenticatedUser, async (req, res) => {
   }
 });
 
+app.post("/api/sync-product-content", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const specifications = body.specifications || {};
+    const currentCopy = body.current_copy || {};
+    const syncInput = {
+      title_zh: cleanText(body.title_zh, 300),
+      category: cleanText(body.category, 300),
+      target_moq: cleanText(body.target_moq, 100),
+      specifications: {
+        material: cleanText(specifications.material, 500),
+        dimensions: cleanText(specifications.dimensions, 500),
+        capacity: cleanText(specifications.capacity, 500),
+        weight: cleanText(specifications.weight, 500),
+        colors: Array.isArray(specifications.colors)
+          ? specifications.colors.map((item) => cleanText(item, 300)).filter(Boolean).slice(0, 30)
+          : [],
+      },
+      customization_crafts: Array.isArray(body.customization_crafts)
+        ? body.customization_crafts.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 10)
+        : [],
+      onsite_customization: body.onsite_customization === "Y" ? "Y" : "N",
+      current_copy: {
+        product_highlights_zh: Array.isArray(currentCopy.product_highlights_zh)
+          ? currentCopy.product_highlights_zh.map((item) => cleanText(item, 600)).filter(Boolean).slice(0, 12)
+          : [],
+        description_zh: cleanText(currentCopy.description_zh, 8000),
+        seo_title_zh: cleanText(currentCopy.seo_title_zh, 300),
+        seo_description_zh: cleanText(currentCopy.seo_description_zh, 1000),
+        seo_keywords: Array.isArray(currentCopy.seo_keywords)
+          ? currentCopy.seo_keywords.map((item) => cleanText(item, 200)).filter(Boolean).slice(0, 30)
+          : [],
+      },
+    };
+
+    if (!syncInput.title_zh) {
+      return res.status(400).json({
+        ok: false,
+        error: "請先填寫繁中商品名稱，再執行同步處理。",
+      });
+    }
+
+    const generated = await generateProductContentSync(syncInput);
+    return res.json({
+      ok: true,
+      result: sanitizeProductContentSyncCopy(generated.result),
+      meta: {
+        model: generated.model,
+        usedFallback: generated.usedFallback,
+        apiAttempts: generated.apiAttempts,
+      },
+    });
+  } catch (error) {
+    const status = Number(error.status) || 500;
+    console.error(
+      `[Product content sync] uid=${req.user?.uid || "unknown"} error=${sanitizeError(error)}`
+    );
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      ok: false,
+      error: sanitizeError(error),
+    });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
 });
@@ -439,6 +559,21 @@ function sanitizeEnglishSyncCopy(result = {}) {
     ...result,
     product_highlights_en: highlights,
     description_en: dedupeParagraphs(result.description_en),
+  };
+}
+
+function sanitizeProductContentSyncCopy(result = {}) {
+  return {
+    ...sanitizeProductCopy(result),
+    title_en: cleanText(result.title_en, 300),
+    seo_title_zh: cleanText(result.seo_title_zh, 300),
+    seo_title_en: cleanText(result.seo_title_en, 300),
+    seo_description_zh: cleanText(result.seo_description_zh, 1000),
+    seo_description_en: cleanText(result.seo_description_en, 1000),
+    seo_keywords: (Array.isArray(result.seo_keywords) ? result.seo_keywords : [])
+      .map((item) => cleanText(item, 200))
+      .filter(Boolean)
+      .slice(0, 30),
   };
 }
 
@@ -814,6 +949,35 @@ async function generateEnglishSync(englishInput) {
     systemInstruction: ENGLISH_SYNC_INSTRUCTION,
     responseSchema: ENGLISH_SYNC_SCHEMA,
     maxOutputTokens: 4096,
+  });
+}
+
+async function generateProductContentSync(syncInput) {
+  const input = [
+    {
+      type: "text",
+      text: `請依規則同步以下 ERP 最新商品母資料與目前文案，並嚴格按照 JSON Schema 回傳：\n${JSON.stringify(
+        {
+          latest_product_data: {
+            title_zh: syncInput.title_zh,
+            category: syncInput.category,
+            target_moq: syncInput.target_moq,
+            specifications: syncInput.specifications,
+            customization_crafts: syncInput.customization_crafts,
+            onsite_customization: syncInput.onsite_customization,
+          },
+          current_copy: syncInput.current_copy,
+        },
+        null,
+        2
+      )}`,
+    },
+  ];
+
+  return generateProductContent(DEFAULT_MODEL, input, {
+    systemInstruction: PRODUCT_CONTENT_SYNC_INSTRUCTION,
+    responseSchema: PRODUCT_CONTENT_SYNC_SCHEMA,
+    maxOutputTokens: 6144,
   });
 }
 
