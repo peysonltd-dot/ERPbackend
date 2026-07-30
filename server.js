@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.3.0";
+const WORKER_VERSION = "2.4.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -208,11 +208,11 @@ const SYSTEM_INSTRUCTION = `
 11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
 12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
 13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
-14. 商品特色採沛森官網既有的列點式規格邏輯，依資料完整度寫 2 至 6 點。優先排列：目標 MOQ、尺寸、容量、重量、材質、產品功能、客製工藝；沒有來源的欄位不要硬湊。
+14. 商品特色採沛森官網既有的列點式規格邏輯，依資料完整度寫 2 至 6 點。優先排列：目標 MOQ、尺寸、容量、重量、材質與產品功能；沒有來源的欄位不要硬湊。
 15. 商品描述使用自然敘述，說明外觀、使用方式、適用情境與企業採購用途；不得改用規格清單，也不可逐句重抄商品特色。
 16. 禁止「質感升級、理想選擇、彰顯品味、精緻呈現、為您打造」等沒有具體資訊的空泛句；沒有新資訊就不要寫。
 17. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
-18. 活動現場客製說明由 ERP 依使用者選項統一附加，AI 的商品特色與商品描述正文不得自行加入或重複「活動現場客製」句子。
+18. 「印製工藝」與「活動現場客製」特色由 ERP 依使用者選項統一附加；AI 的商品特色與商品描述正文不得自行加入或重複這兩類句子。
 19. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
 `;
 
@@ -230,7 +230,7 @@ const ENGLISH_SYNC_INSTRUCTION = `
 6. description_en 使用自然敘述，SEO 欄位使用自然英文；不輸出 Markdown、HTML 或額外說明。
 7. 以 SEO 搜尋意圖為優先，使用具體商品詞、材質、用途與客製工藝；不得加入空泛銷售句或關鍵字堆疊。
 8. 商品特色與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
-9. 若繁中描述已有活動現場客製說明，只翻譯一次，不得另外重複加入同義句。
+9. 「印製工藝」與「活動現場客製」特色由 ERP 統一整理；若輸入中已有這兩類特色，忠實翻譯一次，不得另加同義句。
 `;
 
 function requireEnvironment() {
@@ -608,12 +608,12 @@ ${JSON.stringify(payload, null, 2)}
 補充要求：
 - current_category 是 ERP 已選分類，不要擅自改分類。
 - peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
-- peyson_target_moq 若大於 0，可在商品特色中寫成「最低訂購量：X 件」；requested_customization 可列為「客製方式」，但不得寫成供應商原始規格。
+- peyson_target_moq 若大於 0，可在商品特色中寫成「最低訂購量：X 件」；requested_customization 只作為 ERP 欄位資料，不要自行寫入商品特色。
 - 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
 - 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
-- 商品特色使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質、功能與客製方式；商品描述改用敘述式文案，兩者不要重複。
+- 商品特色使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質與功能；商品描述改用敘述式文案，兩者不要重複。
 - source_text 中的網址只作為來源紀錄，無法證明頁面內容；不得把網址本身當作商品資料。
-- 活動現場客製固定說明由 ERP 另行處理，正文不要自行加入。
+- 「印製工藝」與「活動現場客製」特色由 ERP 另行處理，正文不要自行加入。
 `;
 }
 
