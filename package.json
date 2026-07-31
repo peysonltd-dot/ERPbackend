@@ -1,6 +1,6 @@
 {
   "name": "peyson-erp-backend",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "private": true,
   "description": "Peyson ERP Firebase background worker with Gemini REST API",
   "main": "server.js",
