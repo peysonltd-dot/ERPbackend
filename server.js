@@ -2,9 +2,10 @@ const express = require("express");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { getStorage } = require("firebase-admin/storage");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.7.0";
+const WORKER_VERSION = "2.7.1";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -16,6 +17,11 @@ const GEMINI_TIMEOUT_MS = 120000;
 const IMAGE_TIMEOUT_MS = 30000;
 const MAX_API_ATTEMPTS = 3;
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
+const DELETION_BACKUP_PREFIX = "erp-deletion-backups/";
+const DELETION_BACKUP_RETENTION_DAYS = 30;
+const DELETION_BACKUP_RETENTION_MS =
+  DELETION_BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const DELETION_BACKUP_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const ALLOWED_MODELS = new Set([
   "gemini-3.6-flash",
@@ -55,12 +61,12 @@ const PRODUCT_SCHEMA = {
     product_highlights_zh: {
       type: "array",
       items: { type: "string" },
-      description: "2至6點繁體中文商品特色；採官網列點規格邏輯，優先列出 MOQ、尺寸、容量、重量、材質、功能與客製方式，每點只寫一項有來源依據、具有搜尋價值的資訊。",
+      description: "2至6點繁體中文商品摘要；採官網列點規格邏輯，優先列出 MOQ、尺寸、容量、重量、材質、功能與客製方式，每點只寫一項有來源依據、具有搜尋價值的資訊。",
     },
     product_highlights_en: {
       type: "array",
       items: { type: "string" },
-      description: "與中文特色逐點對應的英文內容。",
+      description: "與中文商品摘要逐點對應的英文內容。",
     },
     description_zh: {
       type: "string",
@@ -245,11 +251,11 @@ const SYSTEM_INSTRUCTION = `
 11. description 欄位只輸出純文字，不輸出 Markdown、HTML 或程式碼區塊。
 12. 品牌名稱一律使用「沛森禮品」，公司正式名稱為「沛森顧問有限公司」；不得產生「沛森國際」或「沛森國際有限公司」。
 13. 來源只寫「保溫」時，英文使用 insulated，不得自行延伸為 vacuum；只有來源明確寫出真空結構時才可使用 vacuum。
-14. 商品特色採沛森官網既有的列點式規格邏輯，依資料完整度寫 2 至 6 點。優先排列：目標 MOQ、尺寸、容量、重量、材質與產品功能；沒有來源的欄位不要硬湊。
-15. 商品描述使用自然敘述，說明外觀、使用方式、適用情境與企業採購用途；不得改用規格清單，也不可逐句重抄商品特色。
+14. 商品摘要採沛森官網既有的列點式規格邏輯，依資料完整度寫 2 至 6 點。優先排列：目標 MOQ、尺寸、容量、重量、材質與產品功能；沒有來源的欄位不要硬湊。
+15. 商品描述使用自然敘述，說明外觀、使用方式、適用情境與企業採購用途；不得改用規格清單，也不可逐句重抄商品摘要。
 16. 禁止「質感升級、理想選擇、彰顯品味、精緻呈現、為您打造」等沒有具體資訊的空泛句；沒有新資訊就不要寫。
-17. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
-18. 「印製工藝」與「活動現場客製」特色由 ERP 依使用者選項統一附加；AI 的商品特色與商品描述正文不得自行加入或重複這兩類句子。
+17. 商品摘要與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
+18. 「印製工藝」與「活動現場客製」摘要由 ERP 依使用者選項統一附加；AI 的商品摘要與商品描述正文不得自行加入或重複這兩類句子。
 19. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
 20. product_tags 是使用者在 ERP 勾選的商品標籤，可作為 user_input 理解工藝、材質、玩法與用途，並自然用於 SEO；不得自行新增輸入中不存在的標籤。
 `;
@@ -264,10 +270,10 @@ const ENGLISH_SYNC_INSTRUCTION = `
 2. 不得新增來源未提供的材質、尺寸、容量、重量、認證、產地、交期、價格、庫存或功能。
 3. 中文只寫「保溫」時使用 insulated，不得擅自翻譯成 vacuum；只有中文明確寫「真空」時才可使用 vacuum。
 4. 品牌名稱使用 Peyson Gifts；公司正式英文名稱使用 Peyson Consulting Co., Ltd.
-5. product_highlights_en 必須與繁中特色逐點對應，數量及順序一致；保留列點式規格結構。
+5. product_highlights_en 必須與繁中商品摘要逐點對應，數量及順序一致；保留列點式規格結構。
 6. description_en 使用自然敘述，SEO 欄位使用自然英文；不輸出 Markdown、HTML 或額外說明。
 7. 以 SEO 搜尋意圖為優先，使用具體商品詞、材質、用途與客製工藝；不得加入空泛銷售句或關鍵字堆疊。
-8. 商品特色與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
+8. 商品摘要與商品描述不得重複同一資訊；兩者合計最多出現一次 Peyson Gifts 或 Peyson Consulting Co., Ltd.，SEO 欄位不受此限制。
 9. 「印製工藝」與「活動現場客製」特色由 ERP 統一整理；若輸入中已有這兩類特色，忠實翻譯一次，不得另加同義句。
 `;
 
@@ -280,13 +286,13 @@ const PRODUCT_CONTENT_SYNC_INSTRUCTION = `
 1. title_zh 由 ERP 保留，不需回傳；title_en 必須依最新 title_zh 重新產生，不得沿用名稱不一致的舊英文。
 2. latest_product_data 與 current_copy 都是可用來源，但結構化欄位一律以 latest_product_data 為準；current_copy 中未被最新資料否定的既有用途或功能可保留。不得新增或猜測規格、功能、認證、產地、交期、價格、庫存或供應商資訊。
 3. latest_product_data 中空白的材質、尺寸、容量、重量或顏色代表該項規格目前不應出現在文案；若 current_copy 含有與最新規格矛盾或已被清空的規格，必須移除。
-4. 商品特色採 2 至 6 點列點式規格，依資料完整度優先放入 MOQ、尺寸、容量、重量、材質、顏色與具體功能；每點只寫一項資訊。
-5. 商品描述使用自然敘述，說明商品外觀、用途、使用情境與企業採購用途；不得逐句重抄商品特色。
-6. product_tags、customization_crafts 與 onsite_customization 只供理解商品情境。「印製工藝」及「活動現場客製」固定特色由 ERP 在回傳後附加，product_highlights 與 description 不得自行加入或重複這兩類句子。
+4. 商品摘要採 2 至 6 點列點式規格，依資料完整度優先放入 MOQ、尺寸、容量、重量、材質、顏色與具體功能；每點只寫一項資訊。
+5. 商品描述使用自然敘述，說明商品外觀、用途、使用情境與企業採購用途；不得逐句重抄商品摘要。
+6. product_tags、customization_crafts 與 onsite_customization 只供理解商品情境。「印製工藝」及「活動現場客製」固定摘要由 ERP 在回傳後附加，product_highlights 與 description 不得自行加入或重複這兩類句子。
 7. SEO 欄位可自然使用最新商品名稱、商品類型、確定規格、商品標籤、企業禮贈品情境與客製工藝，但不可堆疊關鍵字。
 8. 中英文特色的數量、順序與事實必須逐點對應；英文忠實反映最新繁中內容。
 9. 中文只寫「保溫」時，英文使用 insulated；只有明確寫出真空結構時才可使用 vacuum。
-10. 品牌名稱一律使用「沛森禮品」／Peyson Gifts；商品特色與描述合計最多出現一次品牌名稱，一般情況不要主動加入。
+10. 品牌名稱一律使用「沛森禮品」／Peyson Gifts；商品摘要與描述合計最多出現一次品牌名稱，一般情況不要主動加入。
 11. 不輸出 Markdown、HTML、額外說明或指定 JSON Schema 以外的欄位。
 `;
 
@@ -320,11 +326,17 @@ const serviceAccount = parseServiceAccount(
   process.env.FIREBASE_SERVICE_ACCOUNT
 );
 
+const storageBucketName =
+  process.env.FIREBASE_STORAGE_BUCKET ||
+  `${serviceAccount.project_id}.firebasestorage.app`;
+
 initializeApp({
   credential: cert(serviceAccount),
+  storageBucket: storageBucketName,
 });
 
 const db = getFirestore();
+const backupBucket = getStorage().bucket();
 
 const app = express();
 app.disable("x-powered-by");
@@ -478,6 +490,132 @@ app.post("/api/sync-product-content", requireAuthenticatedUser, async (req, res)
   }
 });
 
+app.post("/api/deletion-backups", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const productIds = Array.from(
+      new Set(
+        (Array.isArray(req.body?.productIds) ? req.body.productIds : [])
+          .map((id) => cleanText(id, 300))
+          .filter(Boolean)
+      )
+    ).slice(0, 500);
+
+    if (productIds.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "沒有指定即將刪除的商品。",
+      });
+    }
+
+    const backup = await createDeletionBackup({
+      user: req.user,
+      productIds,
+      reason: cleanText(req.body?.reason, 200) || "permanent-product-deletion",
+      erpVersion: cleanText(req.body?.erpVersion, 40),
+    });
+
+    cleanupExpiredDeletionBackups().catch((error) => {
+      console.error(`[Deletion backup cleanup] ${sanitizeError(error)}`);
+    });
+
+    return res.json({ ok: true, backup });
+  } catch (error) {
+    console.error(
+      `[Deletion backup] uid=${req.user?.uid || "unknown"} error=${sanitizeError(error)}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: `刪除前備份失敗：${sanitizeError(error)}`,
+    });
+  }
+});
+
+app.get("/api/deletion-backups", requireAuthenticatedUser, async (req, res) => {
+  try {
+    const [files] = await backupBucket.getFiles({
+      prefix: DELETION_BACKUP_PREFIX,
+    });
+    const now = Date.now();
+    const backups = files
+      .map((file) => {
+        const createdAt = new Date(file.metadata.timeCreated || 0);
+        return {
+          name: file.name,
+          createdAt: createdAt.toISOString(),
+          expiresAt: new Date(
+            createdAt.getTime() + DELETION_BACKUP_RETENTION_MS
+          ).toISOString(),
+          expired:
+            !Number.isNaN(createdAt.getTime()) &&
+            now - createdAt.getTime() >= DELETION_BACKUP_RETENTION_MS,
+          size: Number(file.metadata.size) || 0,
+          productCount: Number(
+            file.metadata.metadata?.productCount
+          ) || 0,
+          deletionTargetCount: Number(
+            file.metadata.metadata?.deletionTargetCount
+          ) || 0,
+          createdBy: file.metadata.metadata?.createdBy || "",
+        };
+      })
+      .filter((backup) => !backup.expired)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+    return res.json({
+      ok: true,
+      retentionDays: DELETION_BACKUP_RETENTION_DAYS,
+      backups,
+    });
+  } catch (error) {
+    console.error(
+      `[Deletion backup list] uid=${req.user?.uid || "unknown"} error=${sanitizeError(error)}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: `無法讀取刪除備份：${sanitizeError(error)}`,
+    });
+  }
+});
+
+app.get(
+  "/api/deletion-backups/download",
+  requireAuthenticatedUser,
+  async (req, res) => {
+    try {
+      const name = cleanText(req.query?.name, 1000);
+      if (!name.startsWith(DELETION_BACKUP_PREFIX) || !name.endsWith(".json")) {
+        return res.status(400).json({
+          ok: false,
+          error: "備份檔案名稱不正確。",
+        });
+      }
+
+      const file = backupBucket.file(name);
+      const [exists] = await file.exists();
+      if (!exists) {
+        return res.status(404).json({
+          ok: false,
+          error: "找不到指定的刪除備份，可能已超過保留期限。",
+        });
+      }
+
+      const [url] = await file.getSignedUrl({
+        action: "read",
+        expires: Date.now() + 15 * 60 * 1000,
+      });
+      return res.json({ ok: true, url, expiresInMinutes: 15 });
+    } catch (error) {
+      console.error(
+        `[Deletion backup download] uid=${req.user?.uid || "unknown"} error=${sanitizeError(error)}`
+      );
+      return res.status(500).json({
+        ok: false,
+        error: `無法取得刪除備份：${sanitizeError(error)}`,
+      });
+    }
+  }
+);
+
 app.use((_req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
 });
@@ -489,6 +627,168 @@ function sleep(ms) {
 function cleanText(value, maxLength = 12000) {
   if (value === null || value === undefined) return "";
   return String(value).trim().slice(0, maxLength);
+}
+
+function serializeFirestoreValue(value) {
+  if (value === null || value === undefined) return value ?? null;
+  if (Array.isArray(value)) return value.map(serializeFirestoreValue);
+  if (typeof value !== "object") return value;
+  if (
+    typeof value.toDate === "function" &&
+    Number.isFinite(value.seconds)
+  ) {
+    return {
+      __firestoreType: "timestamp",
+      iso: value.toDate().toISOString(),
+      seconds: value.seconds,
+      nanoseconds: value.nanoseconds || 0,
+    };
+  }
+  if (typeof value.path === "string" && value.firestore) {
+    return { __firestoreType: "reference", path: value.path };
+  }
+  if (
+    Number.isFinite(value.latitude) &&
+    Number.isFinite(value.longitude)
+  ) {
+    return {
+      __firestoreType: "geopoint",
+      latitude: value.latitude,
+      longitude: value.longitude,
+    };
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      serializeFirestoreValue(item),
+    ])
+  );
+}
+
+async function createDeletionBackup({
+  user,
+  productIds,
+  reason,
+  erpVersion,
+}) {
+  const [productSnapshot, categorySnapshot, tagSnapshot] = await Promise.all([
+    db.collection("products").get(),
+    db.collection("settings").doc("productCategories").get(),
+    db.collection("settings").doc("productTags").get(),
+  ]);
+  const exportedAt = new Date();
+  const settings = [categorySnapshot, tagSnapshot]
+    .filter((snapshot) => snapshot.exists)
+    .map((snapshot) => ({
+      id: snapshot.id,
+      data: serializeFirestoreValue(snapshot.data()),
+    }));
+  const products = productSnapshot.docs.map((doc) => ({
+    id: doc.id,
+    data: serializeFirestoreValue(doc.data()),
+  }));
+  const targetSet = new Set(productIds);
+  const deletionTargets = products.filter((product) => targetSet.has(product.id));
+  const payload = {
+    backupFormat: "peyson-erp-firestore-products-v1",
+    backupPurpose: "pre-deletion-recovery",
+    erpVersion,
+    firebaseProjectId: serviceAccount.project_id,
+    exportedAt: exportedAt.toISOString(),
+    expiresAt: new Date(
+      exportedAt.getTime() + DELETION_BACKUP_RETENTION_MS
+    ).toISOString(),
+    exportedBy: {
+      uid: cleanText(user?.uid, 300),
+      email: cleanText(user?.email, 500),
+    },
+    deletionRequest: {
+      reason,
+      productIds,
+      matchedProductIds: deletionTargets.map((product) => product.id),
+    },
+    collections: {
+      products,
+      settings,
+    },
+    counts: {
+      products: products.length,
+      settings: settings.length,
+      deletionTargets: deletionTargets.length,
+    },
+  };
+  const datePath = exportedAt.toISOString().slice(0, 10).replace(/-/g, "/");
+  const dateStamp = exportedAt
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
+  const safeUid = cleanText(user?.uid, 80).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const randomSuffix = Math.random().toString(36).slice(2, 10);
+  const objectName =
+    `${DELETION_BACKUP_PREFIX}${datePath}/` +
+    `${dateStamp}-${safeUid || "unknown"}-${randomSuffix}.json`;
+  const file = backupBucket.file(objectName);
+
+  await file.save(JSON.stringify(payload, null, 2), {
+    resumable: false,
+    contentType: "application/json; charset=utf-8",
+    metadata: {
+      cacheControl: "private, no-store",
+      metadata: {
+        purpose: "pre-deletion-recovery",
+        createdBy: cleanText(user?.email, 500),
+        productCount: String(products.length),
+        deletionTargetCount: String(deletionTargets.length),
+        retentionDays: String(DELETION_BACKUP_RETENTION_DAYS),
+      },
+    },
+  });
+
+  return {
+    name: objectName,
+    createdAt: payload.exportedAt,
+    expiresAt: payload.expiresAt,
+    counts: payload.counts,
+  };
+}
+
+function isManagedDeletionBackupFile(file) {
+  const name = String(file?.name || "");
+  const purpose = String(file?.metadata?.metadata?.purpose || "");
+  return (
+    name.startsWith(DELETION_BACKUP_PREFIX) &&
+    name !== DELETION_BACKUP_PREFIX &&
+    name.endsWith(".json") &&
+    purpose === "pre-deletion-recovery"
+  );
+}
+
+async function cleanupExpiredDeletionBackups() {
+  const [files] = await backupBucket.getFiles({
+    prefix: DELETION_BACKUP_PREFIX,
+  });
+  const cutoff = Date.now() - DELETION_BACKUP_RETENTION_MS;
+  const expiredFiles = files.filter((file) => {
+    if (!isManagedDeletionBackupFile(file)) return false;
+    const createdAt = new Date(file.metadata.timeCreated || 0).getTime();
+    return Number.isFinite(createdAt) && createdAt > 0 && createdAt < cutoff;
+  });
+
+  const results = await Promise.allSettled(
+    expiredFiles.map((file) => file.delete())
+  );
+  const deletedCount = results.filter(
+    (result) => result.status === "fulfilled"
+  ).length;
+  const failedCount = results.length - deletedCount;
+
+  if (expiredFiles.length > 0) {
+    console.log(
+      `[Deletion backup cleanup] deleted=${deletedCount} failed=${failedCount}`
+    );
+  }
+
+  return { deletedCount, failedCount };
 }
 
 function stripNonSeoBrands(value) {
@@ -750,11 +1050,11 @@ ${JSON.stringify(payload, null, 2)}
 補充要求：
 - current_category 是 ERP 已選分類，不要擅自改分類。
 - peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
-- peyson_target_moq 若大於 0，可在商品特色中寫成「最低訂購量：X 件」；requested_customization 只作為 ERP 欄位資料，不要自行寫入商品特色。
+- peyson_target_moq 若大於 0，可在商品摘要中寫成「最低訂購量：X 件」；requested_customization 只作為 ERP 欄位資料，不要自行寫入商品摘要。
 - product_tags 是 ERP 人工勾選標籤，可作為 user_input 理解商品工藝、材質、玩法與用途，並自然用於 SEO；不得自行新增標籤。
 - 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
 - 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
-- 商品特色使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質與功能；商品描述改用敘述式文案，兩者不要重複。
+- 商品摘要使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質與功能；商品描述改用敘述式文案，兩者不要重複。
 - source_text 中的網址只作為來源紀錄，無法證明頁面內容；不得把網址本身當作商品資料。
 - 「印製工藝」與「活動現場客製」特色由 ERP 另行處理，正文不要自行加入。
 `;
@@ -1193,9 +1493,21 @@ recoverStaleProducts().catch((error) => {
   console.error(`[Recovery] ${sanitizeError(error)}`);
 });
 
+cleanupExpiredDeletionBackups().catch((error) => {
+  console.error(`[Deletion backup cleanup] ${sanitizeError(error)}`);
+});
+
+const deletionBackupCleanupTimer = setInterval(() => {
+  cleanupExpiredDeletionBackups().catch((error) => {
+    console.error(`[Deletion backup cleanup] ${sanitizeError(error)}`);
+  });
+}, DELETION_BACKUP_CLEANUP_INTERVAL_MS);
+deletionBackupCleanupTimer.unref();
+
 function shutdown(signal) {
   console.log(`${signal} received; shutting down.`);
   unsubscribe();
+  clearInterval(deletionBackupCleanupTimer);
   server.close(() => process.exit(0));
 
   setTimeout(() => process.exit(1), 10000).unref();
