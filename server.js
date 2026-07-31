@@ -4,7 +4,7 @@ const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.6.1";
+const WORKER_VERSION = "2.7.0";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
@@ -251,6 +251,7 @@ const SYSTEM_INSTRUCTION = `
 17. 商品特色與商品描述合計最多出現一次「沛森禮品」或「沛森顧問有限公司」；一般情況不要主動加入品牌名稱。SEO 欄位不受此限制。
 18. 「印製工藝」與「活動現場客製」特色由 ERP 依使用者選項統一附加；AI 的商品特色與商品描述正文不得自行加入或重複這兩類句子。
 19. 若 source_text 只有 1688 網址，該網址只是來源紀錄，不代表已讀取頁面；不得從網址猜測任何商品事實。
+20. product_tags 是使用者在 ERP 勾選的商品標籤，可作為 user_input 理解工藝、材質、玩法與用途，並自然用於 SEO；不得自行新增輸入中不存在的標籤。
 `;
 
 const ENGLISH_SYNC_INSTRUCTION = `
@@ -273,7 +274,7 @@ const ENGLISH_SYNC_INSTRUCTION = `
 const PRODUCT_CONTENT_SYNC_INSTRUCTION = `
 你是 Peyson 沛森顧問有限公司旗下「沛森禮品」的 B2B 商品資料同步編輯。
 
-使用者已在 ERP 編輯頁人工確認並修改商品名稱、規格、MOQ、分類與客製方式。請把這些最新欄位視為唯一有效的母資料，重新整理中英文商品文案。
+使用者已在 ERP 編輯頁人工確認並修改商品名稱、規格、MOQ、分類與商品標籤。請把這些最新欄位視為唯一有效的母資料，重新整理中英文商品文案。
 
 規則：
 1. title_zh 由 ERP 保留，不需回傳；title_en 必須依最新 title_zh 重新產生，不得沿用名稱不一致的舊英文。
@@ -281,8 +282,8 @@ const PRODUCT_CONTENT_SYNC_INSTRUCTION = `
 3. latest_product_data 中空白的材質、尺寸、容量、重量或顏色代表該項規格目前不應出現在文案；若 current_copy 含有與最新規格矛盾或已被清空的規格，必須移除。
 4. 商品特色採 2 至 6 點列點式規格，依資料完整度優先放入 MOQ、尺寸、容量、重量、材質、顏色與具體功能；每點只寫一項資訊。
 5. 商品描述使用自然敘述，說明商品外觀、用途、使用情境與企業採購用途；不得逐句重抄商品特色。
-6. customization_crafts 與 onsite_customization 只供理解客製情境。「印製工藝」及「活動現場客製」固定特色由 ERP 在回傳後附加，product_highlights 與 description 不得自行加入或重複這兩類句子。
-7. SEO 欄位可自然使用最新商品名稱、商品類型、確定規格、企業禮贈品情境與客製工藝，但不可堆疊關鍵字。
+6. product_tags、customization_crafts 與 onsite_customization 只供理解商品情境。「印製工藝」及「活動現場客製」固定特色由 ERP 在回傳後附加，product_highlights 與 description 不得自行加入或重複這兩類句子。
+7. SEO 欄位可自然使用最新商品名稱、商品類型、確定規格、商品標籤、企業禮贈品情境與客製工藝，但不可堆疊關鍵字。
 8. 中英文特色的數量、順序與事實必須逐點對應；英文忠實反映最新繁中內容。
 9. 中文只寫「保溫」時，英文使用 insulated；只有明確寫出真空結構時才可使用 vacuum。
 10. 品牌名稱一律使用「沛森禮品」／Peyson Gifts；商品特色與描述合計最多出現一次品牌名稱，一般情況不要主動加入。
@@ -432,6 +433,9 @@ app.post("/api/sync-product-content", requireAuthenticatedUser, async (req, res)
         ? body.customization_crafts.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 10)
         : [],
       onsite_customization: body.onsite_customization === "Y" ? "Y" : "N",
+      product_tags: Array.isArray(body.product_tags)
+        ? body.product_tags.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 50)
+        : [],
       current_copy: {
         product_highlights_zh: Array.isArray(currentCopy.product_highlights_zh)
           ? currentCopy.product_highlights_zh.map((item) => cleanText(item, 600)).filter(Boolean).slice(0, 12)
@@ -731,6 +735,9 @@ function buildUserPrompt(data, imageCount) {
     current_category: cleanText(data.category, 200),
     peyson_target_moq: cleanText(data.moq, 100),
     requested_customization: cleanText(data.customOptions, 1000),
+    product_tags: Array.isArray(data.productTags)
+      ? data.productTags.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 50)
+      : [],
     image_count: imageCount,
   };
 
@@ -744,6 +751,7 @@ ${JSON.stringify(payload, null, 2)}
 - current_category 是 ERP 已選分類，不要擅自改分類。
 - peyson_target_moq 只可視為 user_input，不可填入 supplier_moq。
 - peyson_target_moq 若大於 0，可在商品特色中寫成「最低訂購量：X 件」；requested_customization 只作為 ERP 欄位資料，不要自行寫入商品特色。
+- product_tags 是 ERP 人工勾選標籤，可作為 user_input 理解商品工藝、材質、玩法與用途，並自然用於 SEO；不得自行新增標籤。
 - 若圖片中包含售價或批發價，只忽略價格，不要把它寫入商品文案。
 - 中英文特色需逐點對應；若某特色沒有可靠來源就不要寫。
 - 商品特色使用列點式規格，優先列出 MOQ、尺寸、容量、重量、材質與功能；商品描述改用敘述式文案，兩者不要重複。
@@ -963,6 +971,7 @@ async function generateProductContentSync(syncInput) {
             category: syncInput.category,
             target_moq: syncInput.target_moq,
             specifications: syncInput.specifications,
+            product_tags: syncInput.product_tags,
             customization_crafts: syncInput.customization_crafts,
             onsite_customization: syncInput.onsite_customization,
           },
@@ -1042,6 +1051,9 @@ async function processProduct(ref) {
       category: cleanText(data.category, 200),
       target_moq: cleanText(data.moq, 100),
       requested_customization: cleanText(data.customOptions, 1000),
+      product_tags: Array.isArray(data.productTags)
+        ? data.productTags.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 50)
+        : [],
     };
 
     await ref.update({
