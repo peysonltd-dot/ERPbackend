@@ -5,16 +5,16 @@ const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getStorage } = require("firebase-admin/storage");
 
 const SERVICE_NAME = "Peyson AI Worker";
-const WORKER_VERSION = "2.7.1";
+const WORKER_VERSION = "2.7.2";
 const PORT = Number(process.env.PORT) || 10000;
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const MODEL_FALLBACK = "gemini-flash-latest";
 const MAX_CONCURRENT_JOBS = 2;
-const MAX_IMAGES = 5;
-const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-const MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_SOURCE_FILES = 5;
+const MAX_SOURCE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_SOURCE_FILE_BYTES = 20 * 1024 * 1024;
 const GEMINI_TIMEOUT_MS = 120000;
-const IMAGE_TIMEOUT_MS = 30000;
+const SOURCE_FILE_TIMEOUT_MS = 30000;
 const MAX_API_ATTEMPTS = 3;
 const STALE_PROCESSING_MS = 15 * 60 * 1000;
 const DELETION_BACKUP_PREFIX = "erp-deletion-backups/";
@@ -31,7 +31,7 @@ const ALLOWED_MODELS = new Set([
   "gemini-pro-latest",
 ]);
 
-const ALLOWED_IMAGE_HOSTS = new Set([
+const ALLOWED_SOURCE_FILE_HOSTS = new Set([
   "firebasestorage.googleapis.com",
   "storage.googleapis.com",
 ]);
@@ -45,6 +45,13 @@ const ALLOWED_IMAGE_TYPES = new Set([
   "image/gif",
   "image/bmp",
   "image/tiff",
+]);
+
+const ALLOWED_DOCUMENT_TYPES = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "text/markdown",
 ]);
 
 const PRODUCT_SCHEMA = {
@@ -113,7 +120,7 @@ const PRODUCT_SCHEMA = {
           value: { type: "string" },
           source: {
             type: "string",
-            description: "text、image_1、image_2、user_input 等來源標記。",
+            description: "text、image_1、document_2、user_input 等來源標記。",
           },
         },
         required: ["label_zh", "label_en", "value", "source"],
@@ -908,8 +915,12 @@ function resolveModel(requestedModel) {
   return ALLOWED_MODELS.has(requested) ? requested : DEFAULT_MODEL;
 }
 
-function normalizeImageUrls(data) {
+function normalizeSourceFiles(data) {
   const candidates = [];
+
+  if (Array.isArray(data.sourceFiles)) {
+    candidates.push(...data.sourceFiles);
+  }
 
   if (Array.isArray(data.sourceImages)) {
     candidates.push(...data.sourceImages);
@@ -923,44 +934,56 @@ function normalizeImageUrls(data) {
     candidates.push(data.imageUrl);
   }
 
-  const urls = candidates
+  const files = candidates
     .map((item) => {
-      if (typeof item === "string") return item;
-      if (!item || typeof item !== "object") return "";
-      return item.downloadURL || item.url || item.src || "";
+      if (typeof item === "string") {
+        return { url: cleanText(item, 3000), name: "", mimeType: "" };
+      }
+      if (!item || typeof item !== "object") return null;
+      return {
+        url: cleanText(item.downloadURL || item.url || item.src, 3000),
+        name: cleanText(item.name, 500),
+        mimeType: cleanText(item.mimeType || item.contentType, 100).toLowerCase(),
+      };
     })
-    .map((url) => cleanText(url, 3000))
-    .filter(Boolean);
+    .filter((item) => item && item.url);
 
-  return [...new Set(urls)].slice(0, MAX_IMAGES);
+  const seen = new Set();
+  return files
+    .filter((item) => {
+      if (seen.has(item.url)) return false;
+      seen.add(item.url);
+      return true;
+    })
+    .slice(0, MAX_SOURCE_FILES);
 }
 
-function validateImageUrl(rawUrl) {
+function validateSourceFileUrl(rawUrl) {
   let url;
 
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error("圖片網址格式不正確。");
+    throw new Error("規格檔案網址格式不正確。");
   }
 
   if (url.protocol !== "https:") {
-    throw new Error("圖片網址必須使用 HTTPS。");
+    throw new Error("規格檔案網址必須使用 HTTPS。");
   }
 
-  if (!ALLOWED_IMAGE_HOSTS.has(url.hostname)) {
+  if (!ALLOWED_SOURCE_FILE_HOSTS.has(url.hostname)) {
     throw new Error(
-      `目前只接受 Firebase Storage 圖片，無法讀取主機：${url.hostname}`
+      `目前只接受 Firebase Storage 規格檔案，無法讀取主機：${url.hostname}`
     );
   }
 
   return url.toString();
 }
 
-async function fetchImageAsInput(rawUrl, imageNumber) {
-  const url = validateImageUrl(rawUrl);
+async function fetchSourceFileAsInput(sourceFile, fileNumber) {
+  const url = validateSourceFileUrl(sourceFile.url);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), SOURCE_FILE_TIMEOUT_MS);
 
   try {
     const response = await fetch(url, {
@@ -970,7 +993,7 @@ async function fetchImageAsInput(rawUrl, imageNumber) {
     });
 
     if (!response.ok) {
-      throw new Error(`圖片 ${imageNumber} 下載失敗（HTTP ${response.status}）。`);
+      throw new Error(`規格檔案 ${fileNumber} 下載失敗（HTTP ${response.status}）。`);
     }
 
     let mimeType = cleanText(
@@ -980,24 +1003,32 @@ async function fetchImageAsInput(rawUrl, imageNumber) {
 
     if (mimeType === "image/jpg") mimeType = "image/jpeg";
 
-    if (!ALLOWED_IMAGE_TYPES.has(mimeType)) {
-      throw new Error(`圖片 ${imageNumber} 的檔案類型不正確。`);
+    if (!mimeType || mimeType === "application/octet-stream") {
+      mimeType = cleanText(sourceFile.mimeType, 100).toLowerCase();
+    }
+
+    const isImage = ALLOWED_IMAGE_TYPES.has(mimeType);
+    const isDocument = ALLOWED_DOCUMENT_TYPES.has(mimeType);
+    if (!isImage && !isDocument) {
+      throw new Error(`規格檔案 ${fileNumber} 的格式不支援，請使用圖片、PDF、TXT、CSV 或 Markdown。`);
     }
 
     const declaredSize = Number(response.headers.get("content-length")) || 0;
-    if (declaredSize > MAX_IMAGE_BYTES) {
-      throw new Error(`圖片 ${imageNumber} 超過 4 MB，請先壓縮後再上傳。`);
+    if (declaredSize > MAX_SOURCE_FILE_BYTES) {
+      throw new Error(`規格檔案 ${fileNumber} 超過 10 MB，請縮小後再上傳。`);
     }
 
     const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length > MAX_IMAGE_BYTES) {
-      throw new Error(`圖片 ${imageNumber} 超過 4 MB，請先壓縮後再上傳。`);
+    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+      throw new Error(`規格檔案 ${fileNumber} 超過 10 MB，請縮小後再上傳。`);
     }
 
     return {
       bytes: bytes.length,
+      kind: isImage ? "image" : "document",
+      label: isImage ? `image_${fileNumber}` : `document_${fileNumber}`,
       input: {
-        type: "image",
+        type: isImage ? "image" : "document",
         data: bytes.toString("base64"),
         mime_type: mimeType,
       },
@@ -1007,29 +1038,33 @@ async function fetchImageAsInput(rawUrl, imageNumber) {
   }
 }
 
-async function buildImageInputs(imageUrls) {
+async function buildSourceFileInputs(sourceFiles) {
   const downloaded = await Promise.all(
-    imageUrls.map((url, index) => fetchImageAsInput(url, index + 1))
+    sourceFiles.map((file, index) => fetchSourceFileAsInput(file, index + 1))
   );
 
   const totalBytes = downloaded.reduce((sum, item) => sum + item.bytes, 0);
-  if (totalBytes > MAX_TOTAL_IMAGE_BYTES) {
-    throw new Error("全部圖片合計超過 12 MB，請減少張數或先壓縮圖片。");
+  if (totalBytes > MAX_TOTAL_SOURCE_FILE_BYTES) {
+    throw new Error("全部規格圖片與檔案合計超過 20 MB，請減少數量或縮小檔案。");
   }
 
   const inputs = [];
-  downloaded.forEach((item, index) => {
+  downloaded.forEach((item) => {
     inputs.push({
       type: "text",
-      text: `以下是 image_${index + 1}：`,
+      text: `以下是 ${item.label}：`,
     });
     inputs.push(item.input);
   });
 
-  return inputs;
+  return {
+    inputs,
+    imageCount: downloaded.filter((item) => item.kind === "image").length,
+    documentCount: downloaded.filter((item) => item.kind === "document").length,
+  };
 }
 
-function buildUserPrompt(data, imageCount) {
+function buildUserPrompt(data, sourceFileCount) {
   const payload = {
     source_text: cleanText(data.rawText),
     current_category: cleanText(data.category, 200),
@@ -1038,7 +1073,7 @@ function buildUserPrompt(data, imageCount) {
     product_tags: Array.isArray(data.productTags)
       ? data.productTags.map((item) => cleanText(item, 100)).filter(Boolean).slice(0, 50)
       : [],
-    image_count: imageCount,
+    source_file_count: sourceFileCount,
   };
 
   return `
@@ -1321,28 +1356,28 @@ async function processProduct(ref) {
   if (!claimed) return;
 
   const { data, attemptCount } = claimed;
-  const imageUrls = normalizeImageUrls(data);
+  const sourceFiles = normalizeSourceFiles(data);
   const startedAt = Date.now();
 
   console.log(
-    `[Job ${ref.id}] started images=${imageUrls.length} requestedModel=${cleanText(
+    `[Job ${ref.id}] started sourceFiles=${sourceFiles.length} requestedModel=${cleanText(
       data.aiModel,
       80
     ) || "default"}`
   );
 
   try {
-    if (!cleanText(data.rawText) && imageUrls.length === 0) {
-      throw new Error("沒有可供 AI 分析的商品文字或圖片。");
+    if (!cleanText(data.rawText) && sourceFiles.length === 0) {
+      throw new Error("沒有可供 AI 分析的商品文字、圖片或檔案。");
     }
 
-    const imageInputs = await buildImageInputs(imageUrls);
+    const sourceFileInputs = await buildSourceFileInputs(sourceFiles);
     const input = [
       {
         type: "text",
-        text: buildUserPrompt(data, imageUrls.length),
+        text: buildUserPrompt(data, sourceFiles.length),
       },
-      ...imageInputs,
+      ...sourceFileInputs.inputs,
     ];
 
     const generated = await generateProductContent(data.aiModel, input);
@@ -1369,7 +1404,9 @@ async function processProduct(ref) {
         requestedModel: cleanText(data.aiModel, 80),
         usedFallback: generated.usedFallback,
         workerVersion: WORKER_VERSION,
-        imageCount: imageUrls.length,
+        sourceFileCount: sourceFiles.length,
+        imageCount: sourceFileInputs.imageCount,
+        documentCount: sourceFileInputs.documentCount,
         apiAttempts: generated.apiAttempts,
         jobAttemptCount: attemptCount,
         interactionId: generated.interactionId,
@@ -1396,7 +1433,9 @@ async function processProduct(ref) {
         provider: "google",
         requestedModel: cleanText(data.aiModel, 80),
         workerVersion: WORKER_VERSION,
-        imageCount: imageUrls.length,
+        sourceFileCount: sourceFiles.length,
+        imageCount: 0,
+        documentCount: 0,
         jobAttemptCount: attemptCount,
         processingMs: Date.now() - startedAt,
         httpStatus: Number(error.status) || 0,
